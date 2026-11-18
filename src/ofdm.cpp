@@ -1,6 +1,7 @@
 #include "ofdm/ofdm.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <random>
 #include <stdexcept>
 
@@ -30,9 +31,19 @@ std::size_t OfdmParams::bin(int k) const {
     return static_cast<std::size_t>(((k % n) + n) % n);
 }
 
+OfdmParams OfdmParams::oversampled(std::size_t L) const {
+    if (!isPowerOfTwo(L)) throw std::invalid_argument("OfdmParams::oversampled: L must be a power of two");
+    OfdmParams q = *this;
+    q.nFft = nFft * L;
+    q.cpLength = cpLength * L;
+    q.windowLength = windowLength * L;
+    return q;
+}
+
 void OfdmParams::validate() const {
     if (!isPowerOfTwo(nFft)) throw std::invalid_argument("OfdmParams: nFft must be a power of two");
     if (cpLength >= nFft) throw std::invalid_argument("OfdmParams: cpLength must be < nFft");
+    if (windowLength > cpLength) throw std::invalid_argument("OfdmParams: windowLength must be <= cpLength");
     if (dataCarriers.empty()) throw std::invalid_argument("OfdmParams: no data carriers");
     if (pilotValues.size() != pilotCarriers.size())
         throw std::invalid_argument("OfdmParams: pilotValues/pilotCarriers size mismatch");
@@ -114,15 +125,37 @@ std::size_t numDataSymbols(const OfdmParams& p, std::size_t numBits) {
     return (numBits + bps - 1) / bps;
 }
 
+namespace {
+
+// Adds OFDM symbol number `index` (0 = preamble) into the frame buffer, with
+// optional WOLA windowing. Symbol `index` starts at index * symbolLength().
+void addSymbolToFrame(const OfdmParams& p, const CVec& bins, std::size_t index, CVec& frame) {
+    const std::size_t w = p.windowLength;
+    const CVec body = ifft(bins);
+    CVec ext = addCyclicPrefix(body, p.cpLength);
+    ext.insert(ext.end(), body.begin(), body.begin() + static_cast<long>(w));  // cyclic suffix
+
+    // Raised-cosine ramps; rampUp[n] + rampDown[n] = 1, so the overlapping
+    // tail of one symbol and head of the next sum to a smooth transition.
+    for (std::size_t n = 0; n < w; ++n) {
+        const double up = 0.5 * (1.0 - std::cos(kPi * (double(n) + 0.5) / double(w)));
+        ext[n] *= up;
+        ext[ext.size() - w + n] *= 1.0 - up;
+    }
+
+    const std::size_t start = index * p.symbolLength();
+    for (std::size_t n = 0; n < ext.size(); ++n) frame[start + n] += ext[n];
+}
+
+}  // namespace
+
 CVec transmitFrame(const OfdmParams& p, const Bits& bits, std::vector<CVec>& dataBinsOut) {
     p.validate();
     const std::size_t bps = p.bitsPerSymbol();
     const std::size_t nSym = numDataSymbols(p, bits.size());
 
-    CVec frame;
-    frame.reserve((nSym + 1) * p.symbolLength());
-    const CVec pre = modulateSymbol(p, preambleBins(p));
-    frame.insert(frame.end(), pre.begin(), pre.end());
+    CVec frame((nSym + 1) * p.symbolLength() + p.windowLength, Complex(0.0, 0.0));
+    addSymbolToFrame(p, preambleBins(p), 0, frame);
 
     dataBinsOut.clear();
     dataBinsOut.reserve(nSym);
@@ -134,8 +167,7 @@ CVec transmitFrame(const OfdmParams& p, const Bits& bits, std::vector<CVec>& dat
                   chunk.begin());
 
         dataBinsOut.push_back(mapSubcarriers(p, qpskModulate(chunk)));
-        const CVec sym = modulateSymbol(p, dataBinsOut.back());
-        frame.insert(frame.end(), sym.begin(), sym.end());
+        addSymbolToFrame(p, dataBinsOut.back(), s + 1, frame);
     }
     return frame;
 }
@@ -164,19 +196,23 @@ CVec estimateChannelLS(const OfdmParams& p, const CVec& frameSamples) {
     return h;
 }
 
-Bits receiveFrame(const OfdmParams& p, const CVec& frameSamples, std::size_t numBits, const CVec& channel) {
+CVec equalizeFrame(const OfdmParams& p, const CVec& frameSamples, std::size_t numSymbols, const CVec& channel) {
     p.validate();
-    if (channel.size() != p.nFft) throw std::invalid_argument("receiveFrame: channel must have nFft bins");
-    const std::size_t nSym = numDataSymbols(p, numBits);
+    if (channel.size() != p.nFft) throw std::invalid_argument("equalizeFrame: channel must have nFft bins");
 
-    Bits out;
-    out.reserve(nSym * p.bitsPerSymbol());
-    for (std::size_t s = 0; s < nSym; ++s) {
+    CVec out;
+    out.reserve(numSymbols * p.numData());
+    for (std::size_t s = 0; s < numSymbols; ++s) {
         CVec bins = demodulateSymbol(p, symbolAt(p, frameSamples, s + 1));
         for (int k : p.dataCarriers) bins[p.bin(k)] /= channel[p.bin(k)];  // zero-forcing equaliser
-        const Bits b = qpskDemodulate(demapSubcarriers(p, bins));
-        out.insert(out.end(), b.begin(), b.end());
+        const CVec data = demapSubcarriers(p, bins);
+        out.insert(out.end(), data.begin(), data.end());
     }
+    return out;
+}
+
+Bits receiveFrame(const OfdmParams& p, const CVec& frameSamples, std::size_t numBits, const CVec& channel) {
+    Bits out = qpskDemodulate(equalizeFrame(p, frameSamples, numDataSymbols(p, numBits), channel));
     out.resize(numBits);
     return out;
 }

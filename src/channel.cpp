@@ -7,11 +7,31 @@
 
 namespace ofdm {
 
+namespace {
+
+// Complex value whose real and imaginary parts are independent N(0, 1),
+// via Marsaglia's polar method on raw 53-bit uniforms.
+// (std::normal_distribution is very slow with MinGW's libstdc++, because
+// generate_canonical evaluates a long-double log on every call.)
+Complex gaussianPair(std::mt19937_64& rng) {
+    const double scale = 1.0 / 9007199254740992.0;  // 2^-53
+    double u, v, s;
+    do {
+        u = 2.0 * double(rng() >> 11) * scale - 1.0;
+        v = 2.0 * double(rng() >> 11) * scale - 1.0;
+        s = u * u + v * v;
+    } while (s >= 1.0 || s == 0.0);
+    const double f = std::sqrt(-2.0 * std::log(s) / s);
+    return Complex(u * f, v * f);
+}
+
+}  // namespace
+
 CVec addAwgn(const CVec& x, double noiseVariance, std::mt19937_64& rng) {
     if (noiseVariance < 0.0) throw std::invalid_argument("addAwgn: negative noise variance");
-    std::normal_distribution<double> gauss(0.0, std::sqrt(noiseVariance / 2.0));
+    const double sigma = std::sqrt(noiseVariance / 2.0);  // per real dimension
     CVec y(x.size());
-    for (std::size_t i = 0; i < x.size(); ++i) y[i] = x[i] + Complex(gauss(rng), gauss(rng));
+    for (std::size_t i = 0; i < x.size(); ++i) y[i] = x[i] + sigma * gaussianPair(rng);
     return y;
 }
 
@@ -34,12 +54,8 @@ CVec rayleighTaps(std::size_t numTaps, double decay, std::mt19937_64& rng) {
         total += power[l];
     }
 
-    std::normal_distribution<double> gauss(0.0, 1.0);
     CVec taps(numTaps);
-    for (std::size_t l = 0; l < numTaps; ++l) {
-        const double sigma = std::sqrt(power[l] / total / 2.0);
-        taps[l] = Complex(sigma * gauss(rng), sigma * gauss(rng));
-    }
+    for (std::size_t l = 0; l < numTaps; ++l) taps[l] = std::sqrt(power[l] / total / 2.0) * gaussianPair(rng);
     return taps;
 }
 

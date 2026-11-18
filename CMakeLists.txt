@@ -11,6 +11,10 @@ endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
+  # Plain (a+bi)(c+di) complex multiply/divide without the C99 Annex G inf/NaN
+  # recovery path (__muldc3), which is very slow in MinGW's libgcc. Safe here:
+  # signals never contain inf/NaN.
+  add_compile_options(-fcx-limited-range)
 endif()
 
 add_library(ofdm
@@ -19,10 +23,11 @@ add_library(ofdm
   src/ofdm.cpp
   src/channel.cpp
   src/metrics.cpp
+  src/pa.cpp
 )
 target_include_directories(ofdm PUBLIC include)
 
-foreach(app ofdm_demo ber_sim papr_ccdf)
+foreach(app ofdm_demo ber_sim papr_ccdf pa_sim)
   add_executable(${app} apps/${app}.cpp)
   target_link_libraries(${app} PRIVATE ofdm)
 endforeach()

@@ -7,11 +7,63 @@
 
 namespace ofdm {
 
+double meanPower(const CVec& x) {
+    if (x.empty()) throw std::invalid_argument("meanPower: empty signal");
+    double sum = 0.0;
+    for (const Complex& v : x) sum += mag2(v);
+    return sum / double(x.size());
+}
+
+std::vector<double> welchPsd(const CVec& x, std::size_t segmentLength) {
+    if (!isPowerOfTwo(segmentLength) || segmentLength < 2)
+        throw std::invalid_argument("welchPsd: segment length must be a power of two >= 2");
+    if (x.size() < segmentLength) throw std::invalid_argument("welchPsd: signal shorter than one segment");
+
+    std::vector<double> window(segmentLength);
+    double windowEnergy = 0.0;
+    for (std::size_t n = 0; n < segmentLength; ++n) {
+        window[n] = 0.5 * (1.0 - std::cos(2.0 * kPi * double(n) / double(segmentLength)));  // periodic Hann
+        windowEnergy += window[n] * window[n];
+    }
+
+    const std::size_t hop = segmentLength / 2;
+    std::vector<double> psd(segmentLength, 0.0);
+    std::size_t segments = 0;
+    for (std::size_t start = 0; start + segmentLength <= x.size(); start += hop) {
+        CVec seg(segmentLength);
+        for (std::size_t n = 0; n < segmentLength; ++n) seg[n] = x[start + n] * window[n];
+        const CVec spec = fft(seg);
+        for (std::size_t k = 0; k < segmentLength; ++k) psd[k] += mag2(spec[k]);
+        ++segments;
+    }
+    for (double& v : psd) v /= double(segments) * windowEnergy;
+    return psd;
+}
+
+double bandPower(const std::vector<double>& psd, int kLow, int kHigh) {
+    const long n = static_cast<long>(psd.size());
+    if (kLow > kHigh || kHigh - kLow >= n) throw std::invalid_argument("bandPower: invalid band");
+    double sum = 0.0;
+    for (int k = kLow; k <= kHigh; ++k) sum += psd[static_cast<std::size_t>(((k % n) + n) % n)];
+    return sum;
+}
+
+double evmRms(const CVec& received, const CVec& reference) {
+    if (received.size() != reference.size() || reference.empty())
+        throw std::invalid_argument("evmRms: size mismatch or empty");
+    double err = 0.0, ref = 0.0;
+    for (std::size_t i = 0; i < received.size(); ++i) {
+        err += mag2(received[i] - reference[i]);
+        ref += mag2(reference[i]);
+    }
+    return std::sqrt(err / ref);
+}
+
 double paprDb(const CVec& x) {
     if (x.empty()) throw std::invalid_argument("paprDb: empty signal");
     double peak = 0.0, sum = 0.0;
     for (const Complex& v : x) {
-        const double pw = std::norm(v);  // |v|^2
+        const double pw = mag2(v);  // |v|^2
         sum += pw;
         if (pw > peak) peak = pw;
     }

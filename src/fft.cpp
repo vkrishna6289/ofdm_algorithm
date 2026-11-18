@@ -1,6 +1,7 @@
 #include "ofdm/fft.hpp"
 
 #include <cmath>
+#include <map>
 #include <stdexcept>
 #include <utility>
 
@@ -9,6 +10,23 @@ namespace ofdm {
 bool isPowerOfTwo(std::size_t n) { return n != 0 && (n & (n - 1)) == 0; }
 
 namespace {
+
+// Forward twiddles e^{-j2pi j/n}, j < n/2, computed once per FFT size.
+// Each value is computed directly with cos/sin (no recurrence) for accuracy.
+// Note: the cache is not thread-safe; add a mutex if FFTs are run from several threads.
+const CVec& twiddles(std::size_t n) {
+    static std::map<std::size_t, CVec> cache;
+    auto it = cache.find(n);
+    if (it == cache.end()) {
+        CVec w(n / 2);
+        for (std::size_t j = 0; j < n / 2; ++j) {
+            const double angle = -2.0 * kPi * double(j) / double(n);
+            w[j] = Complex(std::cos(angle), std::sin(angle));
+        }
+        it = cache.emplace(n, std::move(w)).first;
+    }
+    return it->second;
+}
 
 void fftInPlace(CVec& a, bool inverse) {
     const std::size_t n = a.size();
@@ -24,13 +42,12 @@ void fftInPlace(CVec& a, bool inverse) {
 
     // 2) log2(N) stages of butterflies. Stage with block length `len` combines
     //    two DFTs of size len/2 into one DFT of size len.
-    const double sign = inverse ? 1.0 : -1.0;
+    const CVec& tw = twiddles(n);
     for (std::size_t len = 2; len <= n; len <<= 1) {
         const std::size_t half = len / 2;
+        const std::size_t step = n / len;  // e^{-j2pi j/len} = tw[j * n/len]
         for (std::size_t j = 0; j < half; ++j) {
-            // Twiddle computed directly (not by repeated multiplication) to avoid error build-up.
-            const double angle = sign * 2.0 * kPi * double(j) / double(len);
-            const Complex w(std::cos(angle), std::sin(angle));
+            const Complex w = inverse ? std::conj(tw[j * step]) : tw[j * step];
             for (std::size_t i = 0; i < n; i += len) {
                 const Complex u = a[i + j];
                 const Complex v = a[i + j + half] * w;

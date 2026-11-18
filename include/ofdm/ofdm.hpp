@@ -13,6 +13,14 @@ namespace ofdm {
 struct OfdmParams {
     std::size_t nFft = 64;
     std::size_t cpLength = 16;
+    // Transmit windowing (WOLA). Each symbol is extended by a cyclic suffix of
+    // windowLength samples, its first/last windowLength samples get raised-cosine
+    // ramps, and consecutive symbols overlap-add over that region. This smooths
+    // the symbol boundaries and strongly reduces out-of-band emission.
+    // The overlap lies inside the CP, so the receiver is unchanged, but the
+    // multipath delay spread the CP can absorb shrinks to cpLength - windowLength.
+    // 0 = no windowing (rectangular symbols). Must be <= cpLength.
+    std::size_t windowLength = 0;
     std::vector<int> dataCarriers;
     std::vector<int> pilotCarriers;
     CVec pilotValues;  // one known value per pilot carrier
@@ -25,6 +33,13 @@ struct OfdmParams {
     std::size_t bitsPerSymbol() const { return 2 * numData(); }  // QPSK
     std::size_t symbolLength() const { return nFft + cpLength; }  // samples incl. CP
     std::size_t bin(int k) const;
+
+    // Same system sampled L times faster: nFft and cpLength scale by L, the
+    // occupied subcarriers (and the symbol duration) stay the same, and the
+    // extra bins become wide guard bands. Use this whenever the signal passes a
+    // nonlinearity (e.g. a PA) or its spectrum is measured; at the Nyquist rate
+    // out-of-band regrowth would alias back on top of the signal.
+    OfdmParams oversampled(std::size_t L) const;
 
     // Throws std::invalid_argument if the configuration is inconsistent.
     void validate() const;
@@ -61,7 +76,8 @@ CVec preambleBins(const OfdmParams& p);
 // Number of data OFDM symbols needed for numBits (last symbol zero-padded).
 std::size_t numDataSymbols(const OfdmParams& p, std::size_t numBits);
 
-// bits -> QPSK -> subcarrier mapping -> IFFT -> CP, with preamble in front.
+// bits -> QPSK -> subcarrier mapping -> IFFT -> CP (-> windowing), with preamble in front.
+// Output length: (1 + numDataSymbols) * symbolLength() + windowLength.
 CVec transmitFrame(const OfdmParams& p, const Bits& bits);
 
 // Same, but also returns the frequency-domain bins of every data symbol
@@ -71,6 +87,11 @@ CVec transmitFrame(const OfdmParams& p, const Bits& bits, std::vector<CVec>& dat
 // Least-squares channel estimate H[k] = Y[k] / P[k] from the preamble.
 // Returns N bins; unused bins are zero.
 CVec estimateChannelLS(const OfdmParams& p, const CVec& frameSamples);
+
+// FFT + zero-forcing equalisation of the first numSymbols data symbols.
+// Returns the equalised data-carrier values, numSymbols * numData() of them
+// (before the QPSK decision; useful for EVM and constellation plots).
+CVec equalizeFrame(const OfdmParams& p, const CVec& frameSamples, std::size_t numSymbols, const CVec& channel);
 
 // Demodulates a frame using the supplied channel frequency response H (N bins)
 // for zero-forcing equalisation, then returns the first numBits bits.

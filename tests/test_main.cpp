@@ -1,6 +1,7 @@
 // Unit tests for the OFDM library. Minimal self-contained framework so the
 // project has no external dependencies. Run: ./ofdm_tests  (exit code 0 = pass)
 
+#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <iostream>
@@ -13,6 +14,7 @@
 #include "ofdm/fft.hpp"
 #include "ofdm/metrics.hpp"
 #include "ofdm/ofdm.hpp"
+#include "ofdm/pa.hpp"
 #include "ofdm/qpsk.hpp"
 
 using namespace ofdm;
@@ -274,6 +276,124 @@ void testBerMatchesTheoryAwgn() {
     CHECK(std::abs(ber - theory) / theory < 0.10);
 }
 
+// ---- Oversampling, PA, spectrum ------------------------------------------
+
+void testOversampledSystem() {
+    const OfdmParams p = OfdmParams::wifiLike().oversampled(4);
+    p.validate();
+    CHECK(p.nFft == 256 && p.cpLength == 64 && p.numData() == 48);
+    CHECK_THROWS(OfdmParams::wifiLike().oversampled(3));
+
+    std::mt19937_64 rng(13);
+    const Bits bits = randomBits(960, rng);
+    const CVec tx = transmitFrame(p, bits);
+    CHECK(receiveFrame(p, tx, bits.size()) == bits);
+
+    // Equalised symbols in a clean channel are exactly the transmitted QPSK symbols.
+    const CVec eq = equalizeFrame(p, tx, 10, CVec(p.nFft, Complex(1.0)));
+    CHECK(evmRms(eq, qpskModulate(bits)) < 1e-12);
+
+    // Every 4th oversampled sample equals the Nyquist-rate frame sample (scaled by 1/L).
+    const CVec tx1 = transmitFrame(OfdmParams::wifiLike(), bits);
+    double d = 0.0;
+    for (size_t n = 0; n < tx1.size(); ++n) d = std::max(d, std::abs(tx[4 * n] * 4.0 - tx1[n]));
+    CHECK(d < 1e-12);
+}
+
+void testWindowing() {
+    OfdmParams p = OfdmParams::wifiLike();
+    p.windowLength = 4;
+    p.validate();
+    std::mt19937_64 rng(16);
+    const Bits bits = randomBits(960, rng);
+    const CVec tx = transmitFrame(p, bits);
+    CHECK(tx.size() == 11 * 80 + 4);
+    CHECK(evmRms(equalizeFrame(p, tx, 10, CVec(p.nFft, Complex(1.0))), qpskModulate(bits)) < 1e-12);
+
+    // Multipath up to cpLength - windowLength samples long is still ISI-free.
+    const CVec taps = rayleighTaps(12, 4.0, rng);
+    CHECK(receiveFrame(p, applyMultipath(tx, taps), bits.size()) == bits);
+
+    // Windowing must cut adjacent-channel leakage substantially (4x oversampled).
+    const OfdmParams rect = OfdmParams::wifiLike().oversampled(4);
+    const OfdmParams win = p.oversampled(4);
+    const Bits many = randomBits(200 * p.bitsPerSymbol(), rng);
+    auto aclr = [](const CVec& x, size_t n) {
+        const std::vector<double> psd = welchPsd(x, n);
+        return 10.0 * std::log10(bandPower(psd, 38, 90) / bandPower(psd, -26, 26));
+    };
+    const double aRect = aclr(transmitFrame(rect, many), rect.nFft);
+    const double aWin = aclr(transmitFrame(win, many), win.nFft);
+    std::cout << "    (ACLR rect=" << aRect << " dB, windowed=" << aWin << " dB)\n";
+    CHECK(aWin < aRect - 10.0);
+
+    OfdmParams bad = p;
+    bad.windowLength = 17;
+    CHECK_THROWS(bad.validate());
+}
+
+void testRappPa() {
+    const CVec x = {Complex(1e-3, 0), Complex(0, 100.0), std::polar(0.7, 1.2), Complex(0.0)};
+    const CVec y = rappPa(x, 1.0, 2.0);
+    CHECK(std::abs(y[0] - x[0]) < 1e-12);                 // small signal: linear
+    CHECK(std::abs(std::abs(y[1]) - 1.0) < 1e-6);         // large signal: saturates at Asat
+    CHECK(std::abs(std::arg(y[2]) - 1.2) < 1e-12);        // phase preserved (AM/AM only)
+    CHECK(std::abs(y[2]) < 0.7 && std::abs(y[2]) > 0.6);  // gain compression near the knee
+    CHECK(y[3] == Complex(0.0));
+
+    // Output amplitude is monotonic in input amplitude and never exceeds Asat.
+    double prev = 0.0;
+    for (double r = 0.01; r < 10.0; r *= 1.1) {
+        const double out = std::abs(rappPa({Complex(r)}, 1.0, 3.0)[0]);
+        CHECK(out > prev && out <= 1.0);
+        prev = out;
+    }
+    CHECK_THROWS(rappPa(x, 0.0, 2.0));
+
+    // Fast path (p = 1, 2, 4, 8) and generic path agree with the formula.
+    for (double pp : {1.0, 2.0, 2.5, 3.0, 4.0, 8.0}) {
+        for (double r : {0.1, 0.8, 1.0, 1.7, 5.0}) {
+            const double expect = r / std::pow(1.0 + std::pow(r / 1.3, 2 * pp), 1.0 / (2 * pp));
+            CHECK(std::abs(std::abs(rappPa({Complex(r)}, 1.3, pp)[0]) - expect) < 1e-12);
+        }
+    }
+
+    const CVec sig(100, Complex(0.5, 0.0));  // mean power 0.25
+    CHECK(std::abs(saturationForIbo(sig, 6.0) - std::sqrt(0.25 * dbToLinear(6.0))) < 1e-12);
+}
+
+void testPaHighBackoffIsTransparent() {
+    const OfdmParams p = OfdmParams::wifiLike().oversampled(4);
+    std::mt19937_64 rng(14);
+    const Bits bits = randomBits(960, rng);
+    const CVec tx = transmitFrame(p, bits);
+    const CVec y = rappPa(tx, saturationForIbo(tx, 40.0), 2.0);
+    const CVec eq = equalizeFrame(p, y, 10, estimateChannelLS(p, y));
+    CHECK(evmRms(eq, qpskModulate(bits)) < 1e-3);
+
+    // ...while heavy compression must raise EVM noticeably.
+    const CVec z = rappPa(tx, saturationForIbo(tx, 0.0), 2.0);
+    CHECK(evmRms(equalizeFrame(p, z, 10, estimateChannelLS(p, z)), qpskModulate(bits)) > 0.05);
+}
+
+void testWelchPsd() {
+    std::mt19937_64 rng(15);
+    const CVec noise = addAwgn(CVec(1 << 16, 0.0), 0.5, rng);
+    const std::vector<double> psd = welchPsd(noise, 64);
+    double mean = 0.0;
+    for (double v : psd) mean += v;
+    mean /= double(psd.size());
+    CHECK(std::abs(mean - 0.5) < 0.02);  // flat at the noise variance
+
+    CVec tone(4096);
+    for (size_t n = 0; n < tone.size(); ++n) tone[n] = std::polar(1.0, 2.0 * kPi * 10.0 * double(n) / 64.0);
+    const std::vector<double> tp = welchPsd(tone, 64);
+    CHECK(std::max_element(tp.begin(), tp.end()) - tp.begin() == 10);
+
+    CHECK(std::abs(bandPower({1, 2, 3, 4}, -1, 1) - (4 + 1 + 2)) < 1e-12);
+    CHECK_THROWS(welchPsd(CVec(10), 64));
+}
+
 }  // namespace
 
 int main() {
@@ -294,6 +414,11 @@ int main() {
         {"papr", testPapr},
         {"oversampling", testOversampling},
         {"BER matches theory (AWGN)", testBerMatchesTheoryAwgn},
+        {"oversampled system", testOversampledSystem},
+        {"TX windowing", testWindowing},
+        {"rapp PA", testRappPa},
+        {"PA back-off", testPaHighBackoffIsTransparent},
+        {"welch PSD", testWelchPsd},
     };
 
     for (const auto& t : tests) {

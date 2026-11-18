@@ -2,11 +2,29 @@
 
 #include <cmath>
 #include <cstddef>
+#include <vector>
 
 #include "ofdm/ofdm.hpp"
 #include "ofdm/types.hpp"
 
 namespace ofdm {
+
+// mean |x[n]|^2
+double meanPower(const CVec& x);
+
+// Welch power spectral density estimate: Hann-windowed segments of
+// segmentLength samples, 50% overlap, averaged |FFT|^2 normalised by the
+// window energy (white noise of variance s2 gives a flat PSD of s2).
+// Returned in FFT bin order (bin 0 = DC). segmentLength must be a power of two.
+// With segmentLength == p.nFft, bin k corresponds to subcarrier k.
+std::vector<double> welchPsd(const CVec& x, std::size_t segmentLength);
+
+// Sum of PSD over logical bins kLow..kHigh inclusive (negative k wrap to the top).
+double bandPower(const std::vector<double>& psd, int kLow, int kHigh);
+
+// RMS error vector magnitude relative to the reference power:
+// sqrt( sum|r - ref|^2 / sum|ref|^2 ).  Multiply by 100 for percent.
+double evmRms(const CVec& received, const CVec& reference);
 
 // PAPR = max|x[n]|^2 / mean|x[n]|^2, in dB.
 double paprDb(const CVec& x);
